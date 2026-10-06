@@ -1,0 +1,326 @@
+```yaml
+name: Build RPCSX - SM8750 Oryon
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - rebase-rpcs3-jun2026
+
+jobs:
+  build:
+    # Native ARM64 builder. Do NOT use an x86 runner for this build.
+    runs-on: ubuntu-24.04-arm
+
+    env:
+      CC: clang-23
+      CXX: clang++-23
+
+      # Snapdragon 8 Elite / SM8750:
+      #
+      # Oryon-1 is LLVM's Qualcomm Oryon CPU model.
+      # LLVM models it as Armv8.6-A, which avoids generating LS64
+      # instructions such as LD64B/ST64B.
+      #
+      # -mno-ls64 makes that restriction explicit.
+      #
+      # ThinLTO gives the linker whole-program optimization without the
+      # much larger memory/time cost of full LTO.
+      ARCH_FLAGS: >-
+        -mcpu=oryon-1
+        -mno-ls64
+        -O3
+        -flto=thin
+
+      LDFLAGS: >-
+        -fuse-ld=lld
+        -flto=thin
+
+    steps:
+      - name: Checkout RPCSX
+        uses: actions/checkout@v7
+        with:
+          ref: rebase-rpcs3-jun2026
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            libunwind-dev \
+            libsox-dev \
+            libasound2-dev \
+            nasm \
+            wget
+
+      - name: Install current LLVM
+        shell: bash
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+
+          # LLVM 23 is the current stable series exposed by apt.llvm.org.
+          sudo ./llvm.sh 23
+
+      - name: Verify compiler
+        shell: bash
+        run: |
+          clang-23 --version
+          clang++-23 --version
+          ld.lld-23 --version
+
+          echo
+          echo "Host:"
+          uname -a
+
+          echo
+          echo "Architecture:"
+          uname -m
+
+          test "$(uname -m)" = "aarch64"
+
+      - name: Verify Oryon target
+        shell: bash
+        run: |
+          cat > /tmp/oryon-test.c <<'EOF'
+          int main(void)
+          {
+              return 0;
+          }
+          EOF
+
+          echo "Checking Oryon CPU support..."
+          clang-23 \
+            --target=aarch64-linux-gnu \
+            -mcpu=oryon-1 \
+            -mno-ls64 \
+            -### \
+            -c /tmp/oryon-test.c \
+            2>&1 | tee /tmp/oryon-driver.txt
+
+          grep -q -- '-target-cpu" "oryon-1"' /tmp/oryon-driver.txt
+
+          echo
+          echo "Checking enabled architectural extensions..."
+          clang-23 \
+            --target=aarch64-linux-gnu \
+            --print-enabled-extensions \
+            -mcpu=oryon-1 \
+            -mno-ls64 \
+            | tee /tmp/oryon-extensions.txt
+
+          if grep -qi 'LS64' /tmp/oryon-extensions.txt; then
+            echo "ERROR: LS64 was enabled."
+            exit 1
+          fi
+
+          echo
+          echo "Oryon-1 target verified with LS64 disabled."
+
+      - name: Patch x86-only RPCSX code
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # ------------------------------------------------------------------
+          # RPCSX currently adds -mfsgsbase unconditionally.
+          #
+          # That option is x86-specific and must not be emitted for AArch64.
+          # ------------------------------------------------------------------
+          p = Path("rpcsx/CMakeLists.txt")
+          s = p.read_text()
+
+          old = '  target_compile_options(rpcsx PRIVATE "-mfsgsbase")'
+
+          new = '''  if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+              target_compile_options(rpcsx PRIVATE "-mfsgsbase")
+          endif()'''
+
+          if old not in s:
+              raise SystemExit(
+                  "Could not find the x86 -mfsgsbase setting."
+              )
+
+          s = s.replace(old, new)
+
+          # ------------------------------------------------------------------
+          # RPCSX currently hard-codes the x86-64 libunwind target.
+          # Replace it with an architecture-independent alias.
+          # ------------------------------------------------------------------
+          s = s.replace(
+              "libunwind::unwind-x86_64",
+              "libunwind::unwind-arch",
+          )
+
+          p.write_text(s)
+
+          # ------------------------------------------------------------------
+          # Findlibunwind.cmake also hard-codes unwind-x86_64.
+          # Make it select the correct library for the host architecture.
+          # ------------------------------------------------------------------
+          p = Path("cmake/Findlibunwind.cmake")
+
+          p.write_text(r'''find_package(PkgConfig QUIET)
+          pkg_search_module(UNWIND QUIET IMPORTED_TARGET libunwind)
+
+          if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+              set(RPCSX_LIBUNWIND_ARCH aarch64)
+          else()
+              set(RPCSX_LIBUNWIND_ARCH x86_64)
+          endif()
+
+          find_library(libunwind_arch_LIBRARY
+              NAMES unwind-${RPCSX_LIBUNWIND_ARCH}
+              HINTS "${UNWIND_LIBRARY_DIRS}"
+          )
+
+          include(FindPackageHandleStandardArgs)
+
+          find_package_handle_standard_args(libunwind
+              REQUIRED_VARS
+                  UNWIND_LINK_LIBRARIES
+                  libunwind_arch_LIBRARY
+              VERSION_VAR
+                  UNWIND_VERSION
+          )
+
+          if(libunwind_FOUND AND NOT TARGET libunwind::unwind-arch)
+              add_library(libunwind::unwind-arch UNKNOWN IMPORTED)
+
+              set_target_properties(
+                  libunwind::unwind-arch
+                  PROPERTIES
+                      IMPORTED_LOCATION "${libunwind_arch_LIBRARY}"
+              )
+
+              target_link_libraries(
+                  libunwind::unwind-arch
+                  INTERFACE
+                      PkgConfig::UNWIND
+              )
+          endif()
+
+          mark_as_advanced(libunwind_arch_LIBRARY)
+          ''')
+
+          print("x86-specific RPCSX settings patched for AArch64.")
+
+          PY
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang-23 \
+            -DCMAKE_CXX_COMPILER=clang++-23 \
+            -DCMAKE_C_FLAGS_INIT="${ARCH_FLAGS}" \
+            -DCMAKE_CXX_FLAGS_INIT="${ARCH_FLAGS}" \
+            -DCMAKE_EXE_LINKER_FLAGS_INIT="${LDFLAGS}" \
+            -DCMAKE_SHARED_LINKER_FLAGS_INIT="${LDFLAGS}" \
+            -DWITH_PS4=ON \
+            -DWITH_PS3=OFF \
+            -DUSE_NATIVE_INSTRUCTIONS=OFF \
+            -DWITH_LLVM=OFF \
+            -DBUILD_LLVM=OFF \
+            -DUSE_LTO=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Inspect effective compiler flags
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          commands = json.loads(
+              Path("build/compile_commands.json").read_text()
+          )
+
+          if not commands:
+              raise SystemExit("compile_commands.json is empty")
+
+          text = "\n".join(
+              entry["command"]
+              for entry in commands
+              if "command" in entry
+          )
+
+          checks = {
+              "-mcpu=oryon-1": "-mcpu=oryon-1",
+              "-mno-ls64": "-mno-ls64",
+              "-O3": "-O3",
+              "-flto=thin": "-flto=thin",
+          }
+
+          for name, flag in checks.items():
+              if flag not in text:
+                  raise SystemExit(
+                      f"ERROR: expected {flag} in compile_commands.json"
+                  )
+
+          if "-march=native" in text:
+              raise SystemExit(
+                  "ERROR: -march=native detected; this would target the "
+                  "GitHub runner rather than SM8750."
+              )
+
+          if "-march=armv8.1-a" in text:
+              raise SystemExit(
+                  "ERROR: old RPCSX Armv8.1-A flag detected."
+              )
+
+          print("Effective compile flags:")
+          print("  -mcpu=oryon-1")
+          print("  -mno-ls64")
+          print("  -O3")
+          print("  -flto=thin")
+          print("  no -march=native")
+          print("  no armv8.1-a override")
+          PY
+
+      - name: Build RPCSX
+        shell: bash
+        run: |
+          cmake --build build \
+            --target rpcsx \
+            --parallel "$(nproc)"
+
+      - name: Verify ELF
+        shell: bash
+        run: |
+          test -f build/bin/rpcsx
+
+          echo "Binary:"
+          file build/bin/rpcsx
+
+          echo
+          echo "ELF architecture:"
+          readelf -h build/bin/rpcsx | grep -E \
+            'Class:|Machine:|Type:'
+
+          echo
+          echo "Binary size:"
+          ls -lh build/bin/rpcsx
+
+          echo
+          echo "Dynamic dependencies:"
+          ldd build/bin/rpcsx || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rpcsx-linux-aarch64-sm8750-oryon-v86
+          path: build/bin/rpcsx
+          if-no-files-found: error
+          compression-level: 0
+```
