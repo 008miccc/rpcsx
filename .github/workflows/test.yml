@@ -216,25 +216,21 @@ jobs:
           PY
 
       - name: Configure
-        shell: bash
         run: |
           cmake -S . -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=clang-23 \
             -DCMAKE_CXX_COMPILER=clang++-23 \
-            -DCMAKE_C_FLAGS_INIT="${ARCH_FLAGS}" \
-            -DCMAKE_CXX_FLAGS_INIT="${ARCH_FLAGS}" \
-            -DCMAKE_EXE_LINKER_FLAGS_INIT="${LDFLAGS}" \
-            -DCMAKE_SHARED_LINKER_FLAGS_INIT="${LDFLAGS}" \
+            -DCMAKE_C_FLAGS_INIT="-mcpu=oryon-1 -mno-ls64 -O3 -flto=thin -Wno-clang-format-violations -Wno-error=clang-format-violations" \
+            -DCMAKE_CXX_FLAGS_INIT="-mcpu=oryon-1 -mno-ls64 -O3 -flto=thin -Wno-clang-format-violations -Wno-error=clang-format-violations" \
+            -DCMAKE_EXE_LINKER_FLAGS_INIT="-fuse-ld=lld -flto=thin" \
+            -DCMAKE_SHARED_LINKER_FLAGS_INIT="-fuse-ld=lld -flto=thin" \
+            -DUSE_NATIVE_INSTRUCTIONS=OFF \
+            -DUSE_LTO=ON \
             -DWITH_PS4=ON \
             -DWITH_PS3=OFF \
-            -DUSE_NATIVE_INSTRUCTIONS=OFF \
-            -DWITH_LLVM=OFF \
-            -DBUILD_LLVM=OFF \
-            -DUSE_LTO=ON \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-
       - name: Inspect effective compiler flags
         shell: bash
         run: |
